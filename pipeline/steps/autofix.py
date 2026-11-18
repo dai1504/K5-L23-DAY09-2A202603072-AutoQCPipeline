@@ -27,13 +27,76 @@ Bẫy cần nghĩ tới (có test cho từng cái)
 
 Gợi ý: `yaml.safe_load / safe_dump`.
 """
-from collections import defaultdict  # noqa: F401
+from collections import defaultdict
 
-import yaml  # noqa: F401
+import yaml
 
-from ..common import ERROR, parse_yolo_line  # noqa: F401
+from ..common import ERROR, parse_yolo_line
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    errors = [i for i in issues if i.severity == ERROR]
+    fixes = []
+    remove_codes = {"DUP_IMAGE_EXACT", "DUP_IMAGE_NEAR", "LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+    removed = set()
+    for issue in errors:
+        if issue.code in remove_codes and issue.image not in removed:
+            image = ds.image_path(issue.image)
+            if image:
+                image.unlink()
+            label = ds.label_path(issue.image)
+            if label.exists():
+                label.unlink()
+            removed.add(issue.image)
+            fixes.append(dict(image=issue.image, line=issue.line or "", action="remove_image",
+                              before=issue.code, after="đã xoá ảnh và nhãn"))
+
+    # Lines are numbered in the original file, so collect all removals before rewriting it.
+    drops = defaultdict(set)
+    clips = defaultdict(set)
+    for issue in errors:
+        if issue.image in removed or issue.line is None:
+            continue
+        if issue.code in {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}:
+            drops[issue.image].add(issue.line)
+        elif issue.code == "BOX_OUT_OF_IMAGE":
+            clips[issue.image].add(issue.line)
+    for stem in sorted(set(drops) | set(clips)):
+        path = ds.label_path(stem)
+        if not path.exists():
+            continue
+        original = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        rewritten = []
+        for no, before in enumerate(original, 1):
+            if no in drops[stem]:
+                fixes.append(dict(image=stem, line=no, action="drop_line", before=before, after=""))
+                continue
+            if no in clips[stem]:
+                try:
+                    cls, x, y, w, h = parse_yolo_line(before)
+                    x1, y1 = max(0.0, x - w / 2), max(0.0, y - h / 2)
+                    x2, y2 = min(1.0, x + w / 2), min(1.0, y + h / 2)
+                    if x2 <= x1 or y2 <= y1:
+                        fixes.append(dict(image=stem, line=no, action="drop_line", before=before, after=""))
+                        continue
+                    after = f"{cls} {(x1 + x2) / 2:.10g} {(y1 + y2) / 2:.10g} {x2 - x1:.10g} {y2 - y1:.10g}"
+                    fixes.append(dict(image=stem, line=no, action="clip_box", before=before, after=after))
+                    rewritten.append(after)
+                    continue
+                except ValueError:
+                    # A simultaneous malformed-line issue will normally have put it in drops.
+                    pass
+            rewritten.append(before)
+        path.write_text("\n".join(rewritten) + ("\n" if rewritten else ""), encoding="utf-8")
+
+    if any(i.code == "BAD_CLASS_NAME" for i in errors):
+        data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+        before = data.get("names", {})
+        data["names"] = {i: name for i, name in enumerate(cfg["classes"])}
+        ds.yaml_path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        fixes.append(dict(image="data.yaml", line="", action="rename_classes", before=str(before), after=str(data["names"])))
+    for issue in errors:
+        if issue.code == "MISSING_LABEL_FILE" and issue.image not in removed:
+            fixes.append(dict(image=issue.image, line=issue.line or "", action="needs_label",
+                              before="(không có file)", after="chuyển người gán"))
+    return fixes
